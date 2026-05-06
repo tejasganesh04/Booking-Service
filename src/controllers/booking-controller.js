@@ -5,7 +5,7 @@ const {SuccessResponse,ErrorResponse} = require('../utils/common');
 
 async function createBooking(req,res){
     try {
-        console.log(req.body)
+        
         const response = await BookingService.createBooking({
             flightId: req.body.flightId,//mandatory
             noofSeats: req.body.noofSeats,//mandatory
@@ -16,7 +16,25 @@ async function createBooking(req,res){
     } catch (error) {
         console.log(error)
         ErrorResponse.error = error;
-        return res.status(error.statusCode).json(ErrorResponse);
+        return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
+    }
+
+}
+
+
+async function makePayment(req,res){
+    try {
+        console.log(req.body)
+        const response = await BookingService.makePayment({
+           bookingId: req.body.bookingId,
+            userId: req.body.userId,
+            totalCost:req.body.totalCost
+        });
+        SuccessResponse.data= response;
+        return res.status(StatusCodes.OK).json(SuccessResponse)
+    } catch (error) {
+        ErrorResponse.error = error;
+        return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
     }
 
 }
@@ -26,5 +44,6 @@ async function createBooking(req,res){
 
 
 module.exports = {
-createBooking
+createBooking,
+makePayment
 }
