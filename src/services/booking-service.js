@@ -1,4 +1,17 @@
-//heavy level of business logic this time comp too the flight service
+/*
+ * Booking Service
+ *
+ * Contains all the core business logic for the booking microservice.
+ * This service is heavier than the flight service because it orchestrates
+ * multiple operations across two services (booking DB + flight service HTTP calls)
+ * and manages database transactions manually to ensure data consistency.
+ *
+ * All functions use UNMANAGED transactions:
+ *   - transaction is started manually with db.sequelize.transaction()
+ *   - must explicitly call transaction.commit() on success
+ *   - must explicitly call transaction.rollback() in catch block
+ *   - any query that must be part of the transaction must receive { transaction } in options
+ */
 
 const axios = require('axios')
 
@@ -8,34 +21,62 @@ const{ServerConfig} = require('../config')
 const db = require('../models');
 const AppError = require('../utils/errors/app-error');
 const { StatusCodes } = require('http-status-codes');
+
+// single shared instance of the repository used across all service functions
 const bookingRepository = new BookingRepository()
 const { ENUMS } = require('../utils/common')
 const {BOOKED,CANCELLED} = ENUMS.BOOKING_STATUS;
 
 
-
-
-
-async function createBooking(data){//we will do managed transaction //sequelize docs has great explanation
+/*
+ * createBooking
+ *
+ * Receives: { flightId, noofSeats, userId }
+ *
+ * Steps:
+ *  1. Fetch flight details from the Flight Service via HTTP GET
+ *  2. Check if requested seats <= available seats on the flight — throw 400 if not
+ *  3. Calculate total billing amount = noofSeats * flight.price
+ *  4. Create a booking record in the DB with status INITIATED (inside transaction)
+ *  5. Call Flight Service PATCH to decrement available seats on the flight
+ *  6. Commit the transaction
+ *
+ * Why transaction here:
+ *  - The booking record and seat deduction must succeed or fail together.
+ *    If the PATCH to flight service fails, the booking is rolled back so
+ *    no ghost bookings exist with undeducted seats.
+ *
+ * Returns: true on success
+ * Throws:  AppError 400 if not enough seats, or propagates any other error
+ */
+async function createBooking(data){
 
     const transaction = await db.sequelize.transaction();
-    try{   
-            const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`)//we make call to address where flight service is hossted,replace rawstring later,using for now
+    try{
+            // Step 1: fetch flight details from Flight Service
+            // flight.data.data because Flight Service wraps response as { success, message, data: { flightObj } }
+            const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`)
             const flightData = flight.data.data;
-            
-            if(data.noofSeats > flightData.totalSeats){//s ince managed trans, rolls back txn immediately when we throw an error
-       throw new AppError('Not enough seats available', StatusCodes.BAD_REQUEST);
+
+            // Step 2: seat availability check
+            if(data.noofSeats > flightData.totalSeats){
+                throw new AppError('Not enough seats available', StatusCodes.BAD_REQUEST);
             }
+
+            // Step 3: calculate cost
             const totalBillingAmount = data.noofSeats * flightData.price
             const bookingPayload = {...data,totalCost: totalBillingAmount};
 
-            const booking = await bookingRepository.create(bookingPayload,transaction) // creates a temporary booking in an initiated state. the flow is you reserve seats, give some time to the user to complete payment. there is no payments service but still
-            //now that booking is created, good time to reserve seats
+            // Step 4: create booking in INITIATED state — user has 5 mins to complete payment
+            const booking = await bookingRepository.create(bookingPayload,transaction)
+
+            // Step 5: reserve seats on the flight service (dec defaults to true = decrement)
             const response = await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`,{
                 seats: data.noofSeats
-            })//if api call works u successfully reduced the no of seats
-            
-            await transaction.commit();//currently no db query inside createBooking
+            })
+
+            // Step 6: everything succeeded, make it permanent
+            await transaction.commit();
             return true;
     }catch(error){
         await transaction.rollback();
@@ -45,51 +86,106 @@ async function createBooking(data){//we will do managed transaction //sequelize 
 }
 
 
-async function makePayment(data){ // mimicing a payment gateway - in real world this will be a designated payments service
+/*
+ * makePayment
+ *
+ * Mimics a payment gateway. In a real system this would be a separate Payments microservice.
+ *
+ * Receives: { bookingId, userId, totalCost }
+ *
+ * Steps:
+ *  1. Fetch the booking record from DB
+ *  2. Check if already CANCELLED — throw 400 (cron may have already cleaned it up)
+ *  3. Check if booking is older than 5 minutes — if so, cancel it via cancelBooking()
+ *     and throw 400. This is the hard enforcement of the payment window.
+ *     (cancelBooking uses its own transaction so the cancellation commits independently
+ *      before this function's transaction rolls back)
+ *  4. Validate that the totalCost sent by the client matches the stored totalCost
+ *  5. Validate that the userId matches the booking's userId
+ *  6. Mark the booking as BOOKED and commit
+ *
+ * Two-layer expiry protection:
+ *  - Cron job (janitor):  bulk-cancels abandoned bookings every 2 minutes passively
+ *  - makePayment (bouncer): hard-enforces 5-min limit at the moment of payment
+ *    in case cron hasn't fired yet (worst case cron lag: ~2 min)
+ *
+ * Returns: nothing meaningful (Sequelize update response)
+ * Throws:  AppError 400 for expired/mismatched booking, propagates other errors
+ */
+async function makePayment(data){
     const transaction = await db.sequelize.transaction();
     try {
+        // Step 1: fetch booking
         const bookingDetails = await bookingRepository.get(data.bookingId);
+
+        // Step 2: already cancelled — cron may have beaten us to it
         if(bookingDetails.status == CANCELLED){
             throw new AppError('The booking has expired',StatusCodes.BAD_REQUEST);
         }
+
+        // Step 3: check 5-minute payment window
         const bookingTime = new Date(bookingDetails.createdAt);
         const currentTime = new Date();
-        if(currentTime - bookingTime > 300000){ // now cancel that booking
+        if(currentTime - bookingTime > 300000){
+            // cancelBooking has its own transaction — commits seat restoration independently
             await cancelBooking(data.bookingId);
             throw new AppError('The booking has expired',StatusCodes.BAD_REQUEST);
-            
         }
 
-
-
-
-
+        // Step 4: cost validation — prevents tampered/incorrect payment amounts
         if(bookingDetails.totalCost != data.totalCost){
             throw new AppError('The amount of the payment doesnt match',StatusCodes.BAD_REQUEST);
         }
 
+        // Step 5: user validation — ensures only the original booker can complete payment
         if(bookingDetails.userId!=data.userId){
             throw new AppError('The user corresponding to the booking doesnt match',StatusCodes.BAD_REQUEST );
-        } 
-        //we assume that here, the payment is successful
+        }
+
+        // Step 6: payment assumed successful — mark as BOOKED
         const response = await bookingRepository.update({status:BOOKED},data.bookingId,transaction);
         await transaction.commit();
-        
+
     } catch (error) {
         await transaction.rollback();
         throw error;
     }
 }
 
+/*
+ * cancelBooking
+ *
+ * Cancels a specific booking by ID and restores the seats back to the flight.
+ * Called internally by makePayment when the payment window has expired.
+ *
+ * Receives: bookingId (number)
+ *
+ * Steps:
+ *  1. Fetch the booking (bound to transaction for consistency)
+ *  2. If already CANCELLED — commit and return early (idempotent)
+ *  3. Call Flight Service PATCH with dec:0 to INCREMENT seats back (undo the reservation)
+ *  4. Update booking status to CANCELLED in DB
+ *  5. Commit
+ *
+ * Note: dec:0 means "increment" on the Flight Service PATCH endpoint
+ *       (dec defaults to true/1 = decrement, dec:0 = increment/restore)
+ *
+ * Returns: true if already cancelled, otherwise Sequelize update response
+ * Throws:  propagates any DB or HTTP error up to the caller
+ */
 async function cancelBooking(bookingId){
     const transaction = await db.sequelize.transaction();
     try {
          const bookingDetails = await bookingRepository.get(bookingId,transaction);
+
+         // idempotent — if already cancelled, nothing to do
          if(bookingDetails.status == CANCELLED){
             await transaction.commit();
             return true;
          }
-          await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`,{
+
+         // restore seats back to the flight (dec:0 = increment)
+         await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`,{
                 seats: bookingDetails.noOfSeats,
                 dec:0
             })
@@ -98,15 +194,27 @@ async function cancelBooking(bookingId){
             await transaction.commit();
 
     } catch (error) {
-        
         await transaction.rollback();
         throw error;
     }
 }
 
+/*
+ * cancelOldBookings
+ *
+ * Called by the cron job every 2 minutes.
+ * Computes the cutoff timestamp (5 minutes ago) and delegates to the repository
+ * for a bulk UPDATE — no looping, single DB query regardless of how many rows match.
+ *
+ * Receives: nothing (timestamp parameter is unused — computed internally)
+ *
+ * Returns: Sequelize update response [ affectedRows ]
+ *          affectedRows = 0 means no abandoned bookings found this tick
+ */
 async function cancelOldBookings(timestamp){
 try {
-    const time = new Date(Date.now() - 1000*300);//time 5 mins ago
+    // cutoff: any booking created more than 5 minutes ago
+    const time = new Date(Date.now() - 1000*300);
     const response = await bookingRepository.cancelOldBookings(time);
     return response;
 } catch (error) {
