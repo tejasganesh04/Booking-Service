@@ -13,7 +13,7 @@
  */
 
 const express = require('express');
-const {ServerConfig,Logger} = require('./config'); // auto-picks config/index.js
+const { ServerConfig, Logger, RabbitMQ } = require('./config');
 const apiRoutes = require('./routes');
 const CRON = require('./utils/common/cron-jobs');
 const app = express();
@@ -26,10 +26,12 @@ app.use(express.urlencoded({extended:true}));
 // Mount all versioned API routes under /api  →  /api/v1/...
 app.use('/api', apiRoutes)
 
-app.listen(ServerConfig.PORT,()=>{
+app.listen(ServerConfig.PORT, async () => {
     console.log(`Successfully started server on PORT : ${ServerConfig.PORT}`);
-    //Logger.info("Successfully started the server",{});
 
-    // Start background cron jobs after server is live
+    await RabbitMQ.connectRabbitMQ();
+
+    // Start background cron jobs after RabbitMQ is connected
+    // cron needs getChannel() to publish seat restoration events
     CRON();
 })

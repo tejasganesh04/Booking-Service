@@ -17,7 +17,7 @@ const axios = require('axios')
 
 const {BookingRepository} = require('../repositories');
 
-const{ServerConfig} = require('../config')
+const { ServerConfig, RabbitMQ } = require('../config')
 const db = require('../models');
 const AppError = require('../utils/errors/app-error');
 const { StatusCodes } = require('http-status-codes');
@@ -65,10 +65,14 @@ async function createBooking(data){
 
             // Step 3: calculate cost
             const totalBillingAmount = data.noofSeats * flightData.price
-            const bookingPayload = {...data,totalCost: totalBillingAmount};
+            const bookingPayload = {
+                ...data,
+                totalCost: totalBillingAmount,
+                noOfSeats: data.noofSeats  // map request field name to model field name
+            };
 
             // Step 4: create booking in INITIATED state — user has 5 mins to complete payment
-            const booking = await bookingRepository.create(bookingPayload,transaction)
+            const booking = await bookingRepository.createBooking(bookingPayload,transaction)
 
             // Step 5: reserve seats on the flight service (dec defaults to true = decrement)
             const response = await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`,{
@@ -126,7 +130,7 @@ async function makePayment(data){
         // Step 3: check 5-minute payment window
         const bookingTime = new Date(bookingDetails.createdAt);
         const currentTime = new Date();
-        if(currentTime - bookingTime > 300000){
+        if(currentTime - bookingTime > 600000){
             // cancelBooking has its own transaction — commits seat restoration independently
             await cancelBooking(data.bookingId);
             throw new AppError('The booking has expired',StatusCodes.BAD_REQUEST);
@@ -145,6 +149,25 @@ async function makePayment(data){
         // Step 6: payment assumed successful — mark as BOOKED
         const response = await bookingRepository.update({status:BOOKED},data.bookingId,transaction);
         await transaction.commit();
+
+        // Step 7: publish booking.confirmed event — Reminder Service will send confirmation email
+        // Wrapped in its own try-catch: a failed publish must NOT affect the payment response.
+        // The booking is already committed to DB — that is the source of truth.
+        try {
+            const channel = RabbitMQ.getChannel();
+            channel.sendToQueue(
+                'booking.confirmed',
+                Buffer.from(JSON.stringify({
+                    bookingId: data.bookingId,
+                    userId: data.userId,
+                    flightId: bookingDetails.flightId,
+                    totalCost: data.totalCost
+                })),
+                { persistent: true }
+            );
+        } catch (publishError) {
+            console.error('Failed to publish booking.confirmed event:', publishError.message);
+        }
 
     } catch (error) {
         await transaction.rollback();
@@ -211,15 +234,39 @@ async function cancelBooking(bookingId){
  * Returns: Sequelize update response [ affectedRows ]
  *          affectedRows = 0 means no abandoned bookings found this tick
  */
-async function cancelOldBookings(timestamp){
-try {
-    // cutoff: any booking created more than 5 minutes ago
-    const time = new Date(Date.now() - 1000*300);
-    const response = await bookingRepository.cancelOldBookings(time);
-    return response;
-} catch (error) {
-    console.log(error);
-}
+async function cancelOldBookings(){
+    try {
+        const time = new Date(Date.now() - 1000 * 600);
+
+        // Step 1: fetch expired bookings BEFORE cancelling — we need the data for RabbitMQ
+        const expiredBookings = await bookingRepository.getOldBookings(time);
+        if (!expiredBookings.length) return [];
+
+        // Step 2: cancel exactly these bookings by their IDs (atomic, no race condition)
+        const ids = expiredBookings.map(b => b.id);
+        const response = await bookingRepository.cancelBookingsByIds(ids);
+
+        // Step 3: publish one seat.restoration event per cancelled booking
+        // Flight Service subscribes and restores seats asynchronously
+        // If Flight Service is down, events wait durably in the queue until it recovers
+        const channel = RabbitMQ.getChannel();
+        expiredBookings.forEach(booking => {
+            channel.sendToQueue(
+                'seat.restoration',
+                Buffer.from(JSON.stringify({
+                    bookingId: booking.id,
+                    flightId: booking.flightId,
+                    seats: booking.noOfSeats
+                })),
+                { persistent: true } // message survives RabbitMQ restart
+            );
+        });
+
+        console.log(`Cancelled ${ids.length} expired bookings, published ${ids.length} seat restoration events`);
+        return response;
+    } catch (error) {
+        console.log(error);
+    }
 }
 
 

@@ -36,7 +36,7 @@ function scheduleCrons(){
      *   but makePayment independently enforces the hard 5-minute cutoff at payment time,
      *   so no user ever actually gets more than 5 minutes regardless of cron timing.
      */
-    cron.schedule('*/2 * * * *', async () => {
+    cron.schedule('*/5 * * * *', async () => {
         const response = await BookingService.cancelOldBookings();
         console.log(response); // logs [ affectedRows ] — 0 if no abandoned bookings this tick
     });

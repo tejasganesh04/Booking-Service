@@ -90,6 +90,45 @@ class BookingRepository extends CrudRepository{
      * Receives: timestamp (Date) — the cutoff time (now - 5 minutes)
      * Returns:  [ affectedRows ] — 0 means no abandoned bookings found this tick
      */
+    /*
+     * getOldBookings
+     * Fetches all INITIATED/PENDING bookings older than the given timestamp.
+     * Called by the cron job BEFORE cancelling, so we have the data needed
+     * to publish seat restoration events to RabbitMQ.
+     *
+     * Receives: timestamp (Date) — cutoff time (now - 5 minutes)
+     * Returns:  array of Booking instances (may be empty)
+     */
+    async getOldBookings(timestamp) {
+        return await Booking.findAll({
+            where: {
+                createdAt: { [Op.lt]: timestamp },
+                status: { [Op.notIn]: [BOOKED, CANCELLED] }
+            }
+        });
+    }
+
+    /*
+     * cancelBookingsByIds
+     * Bulk UPDATE — cancels exactly the bookings identified by the given IDs.
+     * Called after getOldBookings so we cancel precisely what we selected,
+     * avoiding race conditions from using the time filter twice.
+     *
+     * Receives: ids (number[]) — array of booking primary keys
+     * Returns:  [ affectedRows ]
+     */
+    async cancelBookingsByIds(ids) {
+        return await Booking.update(
+            { status: CANCELLED },
+            {
+                where: {
+                    id: { [Op.in]: ids },
+                    status: { [Op.notIn]: [BOOKED, CANCELLED] } // safety: don't touch paid bookings
+                }
+            }
+        );
+    }
+
     async cancelOldBookings(timestamp){
         const response = await Booking.update(
             { status: CANCELLED },
