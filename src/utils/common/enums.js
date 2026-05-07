@@ -9,7 +9,7 @@ const BOOKING_STATUS = {
     BOOKED : 'booked',
     CANCELLED: 'cancelled',
     INITIATED: 'initiated',
-    PENDING: 'pending'
+    PENDING: 'pending' // we are using it as a placeholder for a real payments service but actually we dont use it
 }
 
 
