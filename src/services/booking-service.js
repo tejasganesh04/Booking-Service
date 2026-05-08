@@ -81,7 +81,7 @@ async function createBooking(data){
 
             // Step 6: everything succeeded, make it permanent
             await transaction.commit();
-            return true;
+            return booking;
     }catch(error){
         await transaction.rollback();
         console.log(error);
@@ -178,7 +178,7 @@ async function makePayment(data){
 /*
  * cancelBooking
  *
- * Cancels a specific booking by ID and restores the seats back to the flight.
+ * Cancels a specific booking by ID and publishes a seat restoration event.
  * Called internally by makePayment when the payment window has expired.
  *
  * Receives: bookingId (number)
@@ -186,35 +186,54 @@ async function makePayment(data){
  * Steps:
  *  1. Fetch the booking (bound to transaction for consistency)
  *  2. If already CANCELLED — commit and return early (idempotent)
- *  3. Call Flight Service PATCH with dec:0 to INCREMENT seats back (undo the reservation)
- *  4. Update booking status to CANCELLED in DB
- *  5. Commit
+ *  3. Update booking status to CANCELLED in DB
+ *  4. Commit transaction
+ *  5. Publish seat.restoration event to RabbitMQ — Flight Service restores seats asynchronously
  *
- * Note: dec:0 means "increment" on the Flight Service PATCH endpoint
- *       (dec defaults to true/1 = decrement, dec:0 = increment/restore)
+ * Why RabbitMQ instead of direct HTTP (previous approach):
+ *  - Consistent with cancelOldBookings (cron) — all cancellations use the same pattern
+ *  - If Flight Service is down, the event waits durably in the queue until it recovers
+ *  - Direct HTTP would silently drop the seat restoration if Flight Service was unavailable
  *
- * Returns: true if already cancelled, otherwise Sequelize update response
- * Throws:  propagates any DB or HTTP error up to the caller
+ * Why publish AFTER commit (not inside transaction):
+ *  - Same pattern as booking.confirmed in makePayment
+ *  - The DB is the source of truth — booking is CANCELLED regardless of publish success
+ *  - A failed publish is logged but does not affect the cancellation response
+ *
+ * Returns: true if already cancelled, otherwise void
+ * Throws:  propagates any DB error up to the caller
  */
 async function cancelBooking(bookingId){
     const transaction = await db.sequelize.transaction();
     try {
-         const bookingDetails = await bookingRepository.get(bookingId,transaction);
+        const bookingDetails = await bookingRepository.get(bookingId, transaction);
 
-         // idempotent — if already cancelled, nothing to do
-         if(bookingDetails.status == CANCELLED){
+        // idempotent — if already cancelled, nothing to do
+        if(bookingDetails.status == CANCELLED){
             await transaction.commit();
             return true;
-         }
+        }
 
-         // restore seats back to the flight (dec:0 = increment)
-         await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`,{
-                seats: bookingDetails.noOfSeats,
-                dec:0
-            })
+        await bookingRepository.update({status: CANCELLED}, bookingId, transaction);
+        await transaction.commit();
 
-            await bookingRepository.update({status:CANCELLED}, bookingId, transaction);
-            await transaction.commit();
+        // Publish seat restoration event AFTER commit — booking is already cancelled in DB.
+        // Flight Service subscriber increments totalSeats back asynchronously.
+        // Wrapped in try-catch: a failed publish does not affect the cancellation.
+        try {
+            const channel = RabbitMQ.getChannel();
+            channel.sendToQueue(
+                'seat.restoration',
+                Buffer.from(JSON.stringify({
+                    bookingId: bookingId,
+                    flightId: bookingDetails.flightId,
+                    seats: bookingDetails.noOfSeats
+                })),
+                { persistent: true }
+            );
+        } catch (publishError) {
+            console.error('Failed to publish seat.restoration event:', publishError.message);
+        }
 
     } catch (error) {
         await transaction.rollback();
@@ -272,9 +291,55 @@ async function cancelOldBookings(){
 
 
 
+/*
+ * cancelUserBooking
+ *
+ * User-initiated cancellation. Verifies ownership before delegating to cancelBooking.
+ *
+ * Receives: { bookingId, userId }
+ *
+ * Steps:
+ *  1. Fetch the booking
+ *  2. Verify the booking belongs to the requesting user — throw 403 if not
+ *  3. Delegate to cancelBooking — handles idempotency, DB update, and seat restoration event
+ *
+ * Why not just expose cancelBooking directly?
+ *  - cancelBooking has no user context — it's an internal function called by makePayment and cron
+ *  - Adding ownership check here keeps cancelBooking pure (no auth concern)
+ *
+ * Returns: void
+ * Throws:  AppError 404 if booking not found, AppError 403 if userId mismatch
+ */
+async function cancelUserBooking(data) {
+    const booking = await bookingRepository.get(data.bookingId);
+
+    if (String(booking.userId) !== String(data.userId)) {
+        throw new AppError('You are not authorised to cancel this booking', StatusCodes.FORBIDDEN);
+    }
+
+    await cancelBooking(data.bookingId);
+}
+
+
+/*
+ * getBookingsByUser
+ *
+ * Returns all bookings for a given user, newest first.
+ * No pagination — acceptable for this project scope.
+ *
+ * Receives: userId (number | string)
+ * Returns:  array of Booking instances
+ */
+async function getBookingsByUser(userId) {
+    return await bookingRepository.getBookingsByUserId(userId);
+}
+
+
 module.exports = {
 createBooking,
 makePayment,
 cancelBooking,
-cancelOldBookings
+cancelOldBookings,
+cancelUserBooking,
+getBookingsByUser
 }

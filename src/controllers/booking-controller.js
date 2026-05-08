@@ -28,7 +28,7 @@ const {SuccessResponse,ErrorResponse} = require('../utils/common');
  * Calls:     BookingService.createBooking()
  *
  * Responds:
- *   200 OK    — booking created successfully, returns true
+ *   200 OK    — booking created, returns booking object (id, status, totalCost, noOfSeats etc.)
  *   400/500   — not enough seats, flight not found, or unexpected error
  */
 async function createBooking(req,res){
@@ -37,7 +37,7 @@ async function createBooking(req,res){
         const response = await BookingService.createBooking({
             flightId: req.body.flightId,//mandatory
             noofSeats: req.body.noofSeats,//mandatory
-            userId: req.body.userId
+            userId: req.headers['x-user-id'] // injected by API Gateway from JWT — never trust client-supplied userId
         });
         SuccessResponse.data= response;
         return res.status(StatusCodes.OK).json(SuccessResponse)
@@ -72,9 +72,9 @@ async function makePayment(req,res){
     try {
         console.log(req.body)
         const response = await BookingService.makePayment({
-           bookingId: req.body.bookingId,
-            userId: req.body.userId,
-            totalCost:req.body.totalCost
+            bookingId: req.body.bookingId,
+            userId: req.headers['x-user-id'], // injected by API Gateway from JWT — never trust client-supplied userId
+            totalCost: req.body.totalCost
         });
         SuccessResponse.data= response;
         return res.status(StatusCodes.OK).json(SuccessResponse)
@@ -90,7 +90,59 @@ async function makePayment(req,res){
 
 
 
+/*
+ * cancelUserBooking
+ *
+ * Receives:  POST /api/v1/booking/cancel
+ *   req.body: { bookingId (required) }
+ *   userId injected by API Gateway from JWT — never from body
+ *
+ * Responds:
+ *   200 OK  — booking cancelled (or already was cancelled — idempotent)
+ *   403     — booking belongs to a different user
+ *   404     — booking not found
+ *   500     — unexpected error
+ */
+async function cancelUserBooking(req, res) {
+    try {
+        await BookingService.cancelUserBooking({
+            bookingId: req.body.bookingId,
+            userId: req.headers['x-user-id']
+        });
+        SuccessResponse.data = { message: 'Booking cancelled successfully' };
+        return res.status(StatusCodes.OK).json(SuccessResponse);
+    } catch (error) {
+        ErrorResponse.error = error;
+        return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
+    }
+}
+
+
+/*
+ * getMyBookings
+ *
+ * Receives:  GET /api/v1/booking/my-bookings
+ *   userId injected by API Gateway from JWT — no body needed
+ *
+ * Responds:
+ *   200 OK  — array of bookings for the authenticated user (may be empty)
+ *   500     — unexpected error
+ */
+async function getMyBookings(req, res) {
+    try {
+        const bookings = await BookingService.getBookingsByUser(req.headers['x-user-id']);
+        SuccessResponse.data = bookings;
+        return res.status(StatusCodes.OK).json(SuccessResponse);
+    } catch (error) {
+        ErrorResponse.error = error;
+        return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
+    }
+}
+
+
 module.exports = {
 createBooking,
-makePayment
+makePayment,
+cancelUserBooking,
+getMyBookings
 }
