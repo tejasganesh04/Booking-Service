@@ -129,6 +129,21 @@ class BookingRepository extends CrudRepository{
         );
     }
 
+    /*
+     * getBookingsByUserId
+     * Fetches all bookings for a given user, ordered newest first.
+     * Used by the GET /my-bookings endpoint.
+     *
+     * Receives: userId (number)
+     * Returns:  array of Booking instances (may be empty)
+     */
+    async getBookingsByUserId(userId) {
+        return await Booking.findAll({
+            where: { userId },
+            order: [['createdAt', 'DESC']]
+        });
+    }
+
     async cancelOldBookings(timestamp){
         const response = await Booking.update(
             { status: CANCELLED },
